@@ -2,7 +2,5 @@ __pycache__/
 .vscode/
 controlnet-model/
 demo.gif
-diffusers/
 hed-network.pth
-model/video_diffusion/models/test.py
 wf-genius/
