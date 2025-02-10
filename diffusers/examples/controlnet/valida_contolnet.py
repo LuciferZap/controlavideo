@@ -429,11 +429,10 @@ def parse_args(input_args=None):
         default=None,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
-    # TODO change checkpoint save step here
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=10,
+        default=500,
         help=(
             "Save a checkpoint of the training state every X updates. Checkpoints can be used for resuming training via `--resume_from_checkpoint`. "
             "In the case that the checkpoint is better than the final trained model, the checkpoint can also be used for inference."
@@ -448,10 +447,11 @@ def parse_args(input_args=None):
         default=None,
         help=("Max number of checkpoints to store."),
     )
+    # TODO change path here
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default=None,
+        default="/data/fengzhanpeng/control-a-video/controlnet-model/checkpoint-10",
         help=(
             "Whether training should be resumed from a previous checkpoint. Use a path saved by"
             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
@@ -657,7 +657,6 @@ def parse_args(input_args=None):
         default=1,
         help="Number of images to be generated for each `--validation_image`, `--validation_prompt` pair",
     )
-    # TODO change validation step here
     parser.add_argument(
         "--validation_steps",
         type=int,
@@ -963,8 +962,8 @@ def main(args):
     vae.requires_grad_(False)
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    controlnet.train()
-
+    controlnet.eval()
+    unet.eval()
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             import xformers
@@ -1114,16 +1113,45 @@ def main(args):
             path = dirs[-1] if len(dirs) > 0 else None
 
         if path is None:
-            accelerator.print(
-                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
-            )
+            accelerator.print(f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run.")
             args.resume_from_checkpoint = None
             initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            
+            # 1. 先加载safetensors格式的checkpoint
+            from safetensors.torch import load_file
+            checkpoint_path = os.path.join(args.resume_from_checkpoint, "controlnet/diffusion_pytorch_model.safetensors")
+            checkpoint = load_file(checkpoint_path)
+            
+            # 2. 创建新的controlnet并修改第一层
+            controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
+            original_conv = controlnet.controlnet_cond_embedding.conv_in
+            new_conv = torch.nn.Conv2d(
+                in_channels=9,
+                out_channels=original_conv.out_channels,
+                kernel_size=original_conv.kernel_size,
+                stride=original_conv.stride,
+                padding=original_conv.padding,
+                bias=original_conv.bias is not None
+            )
+            
+            # 3. 加载第一层的权重
+            conv_weight_key = 'controlnet_cond_embedding.conv_in.weight'
+            conv_bias_key = 'controlnet_cond_embedding.conv_in.bias'
+            if conv_weight_key in checkpoint:
+                new_conv.weight.data.copy_(checkpoint[conv_weight_key])
+            if conv_bias_key in checkpoint and new_conv.bias is not None:
+                new_conv.bias.data.copy_(checkpoint[conv_bias_key])
+            
+            # 4. 替换第一层
+            controlnet.controlnet_cond_embedding.conv_in = new_conv
+            
+            # 5. 加载其他层的权重
+            controlnet.load_state_dict(checkpoint, strict=False)
+            
+            
             global_step = int(path.split("-")[1])
-
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
     else:
@@ -1142,6 +1170,20 @@ def main(args):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
                 # Convert images to latent space
+                # TODO change image save dir
+                image_logs = log_validation(
+                    vae,
+                    text_encoder,
+                    tokenizer,
+                    unet,
+                    controlnet,
+                    args,
+                    accelerator,
+                    weight_dtype,
+                    global_step,
+                    batch=batch,
+                )
+                exit()
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
