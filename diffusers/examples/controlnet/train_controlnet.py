@@ -190,7 +190,7 @@ def image_grid(imgs, rows, cols):
 
 
 def log_validation(
-    vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, is_final_validation=False
+    vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, is_final_validation=False, batch=None
 ):
     logger.info("Running validation... ")
 
@@ -198,6 +198,7 @@ def log_validation(
         controlnet = accelerator.unwrap_model(controlnet)
     else:
         controlnet = ControlNetModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
+
 
     pipeline = StableDiffusionControlNetPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -223,39 +224,34 @@ def log_validation(
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-    if len(args.validation_image) == len(args.validation_prompt):
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_image) == 1:
-        validation_images = args.validation_image * len(args.validation_prompt)
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_prompt) == 1:
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt * len(args.validation_image)
-    else:
-        raise ValueError(
-            "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
-        )
-
+    
     image_logs = []
     inference_ctx = contextlib.nullcontext() if is_final_validation else torch.autocast("cuda")
+    validation_images = batch["conditioning_pixel_values"]
+    validation_prompt = ["" for each in validation_images]
 
-    for validation_prompt, validation_image in zip(validation_prompts, validation_images):
-        validation_image = Image.open(validation_image).convert("RGB")
+    validation_input_ids = batch["input_ids"]
+    validation_embeds = text_encoder(validation_input_ids)[0]
+
+    for each_validation_embed, each_validation_image in zip(validation_embeds, validation_images):
 
         images = []
+        each_validation_embed = each_validation_embed.unsqueeze(0)
+        each_validation_image = each_validation_image.unsqueeze(0)
 
         for _ in range(args.num_validation_images):
             with inference_ctx:
                 image = pipeline(
-                    validation_prompt, validation_image, num_inference_steps=20, generator=generator
+                    prompt_embeds=each_validation_embed, image=each_validation_image, num_inference_steps=20, generator=generator
                 ).images[0]
 
             images.append(image)
 
         image_logs.append(
-            {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt}
+            {"validation_image": each_validation_image, "images": images, "validation_prompt": validation_prompt}
         )
+        break
+
 
     tracker_key = "test" if is_final_validation else "validation"
     for tracker in accelerator.trackers:
@@ -267,14 +263,18 @@ def log_validation(
 
                 formatted_images = []
 
-                formatted_images.append(np.asarray(validation_image))
 
                 for image in images:
                     formatted_images.append(np.asarray(image))
 
                 formatted_images = np.stack(formatted_images)
 
-                tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
+                if isinstance(validation_prompt, list):
+                    tag = "validation_images"  # 使用一个固定的tag名称
+                else:
+                    tag = validation_prompt
+
+                tracker.writer.add_images(tag, formatted_images, step, dataformats="NHWC")
         elif tracker.name == "wandb":
             formatted_images = []
 
@@ -653,13 +653,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--num_validation_images",
         type=int,
-        default=4,
+        default=1,
         help="Number of images to be generated for each `--validation_image`, `--validation_prompt` pair",
     )
     parser.add_argument(
         "--validation_steps",
         type=int,
-        default=100,
+        default=10,
         help=(
             "Run validation every X steps. Validation consists of running the prompt"
             " `args.validation_prompt` multiple times: `args.num_validation_images`"
@@ -1229,7 +1229,7 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompt is not None and global_step % args.validation_steps == 0:
+                    if global_step % args.validation_steps == 0:
                         image_logs = log_validation(
                             vae,
                             text_encoder,
@@ -1240,6 +1240,7 @@ def main(args):
                             accelerator,
                             weight_dtype,
                             global_step,
+                            batch=batch,
                         )
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
